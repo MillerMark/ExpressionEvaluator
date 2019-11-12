@@ -62,9 +62,9 @@ namespace CodingSeb.ExpressionEvaluator
 	{
 		public string Condition { get; set; }
 		public string Body { get; set; }
-		public IfStatement(string condition, string body, int i)
+		public IfStatement(string condition, string body, int i, int instructionPointOffset)
 		{
-			StartOffset = i - body.Length;
+			StartOffset = instructionPointOffset + i - body.Length;
 			Condition = condition;
 			Body = body;
 		}
@@ -1034,12 +1034,6 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		string MoveThroughScript(string script, int instructionPointOffset, int offset, int length)
-		{
-			//AdvanceExecutionPointer(script, instructionPointOffset + offset, length);
-			return script.Substring(offset, length);
-		}
-
 		protected virtual object ScriptEvaluate(string script, ref bool valueReturned, ref bool breakCalled, ref bool continueCalled, int instructionPointOffset)
 		{
 			AdvanceExecutionPointer(script, instructionPointOffset, script.Length);
@@ -1093,7 +1087,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 			object ScriptExpressionEvaluate(ref int index)
 			{
-				string expression = MoveThroughScript(script, instructionPointOffset, startOfExpression, index - startOfExpression);
+				string expression = script.Substring(startOfExpression, index - startOfExpression);
 
 				startOfExpression = index + 1;
 
@@ -1256,7 +1250,7 @@ namespace CodingSeb.ExpressionEvaluator
 							}
 							else if (script[i] == ';')
 							{
-								subScript = MoveThroughScript(script, instructionPointOffset, startOfExpression, i + 1 - startOfExpression);
+								subScript = script.Substring(startOfExpression, i + 1 - startOfExpression);
 								continueExpressionParsing = false;
 							}
 
@@ -1275,7 +1269,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i));
+							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i, instructionPointOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.ElseIf;
 						}
 					}
@@ -1287,7 +1281,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							ifElseStatementsList.Add(new IfStatement("true", subScript, i));
+							ifElseStatementsList.Add(new IfStatement("true", subScript, i, instructionPointOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.NoBlockEvaluated;
 						}
 					}
@@ -1321,7 +1315,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 						if (keyword.Equals("if", StringComparisonForCasing))
 						{
-							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i));
+							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i, instructionPointOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.If;
 							tryBlockEvaluatedState = TryBlockEvaluatedState.NoBlockEvaluated;
 						}
@@ -2537,7 +2531,7 @@ namespace CodingSeb.ExpressionEvaluator
 			string s = expression.Substring(i, 1);
 
 			if (s.Equals(")"))
-				throw new Exception($"To much ')' characters are defined in expression : [{expression}] : no corresponding '(' fund.");
+				throw new Exception($"Too many ')' characters are defined in expression : [{expression}] : no corresponding '(' fund.");
 
 			if (s.Equals("("))
 			{
