@@ -21,18 +21,39 @@ using System.Text.RegularExpressions;
 
 namespace CodingSeb.ExpressionEvaluator
 {
-	public class FlowStatement
+	public class StackFrame
+	{
+		public string Code { get; set; }
+		public int InstructionPointer { get; set; }
+		public StackFrame()
+		{
+			
+		}
+	}
+	public class CodePosition
 	{
 		public int StartOffset { get; set; }
-		public FlowStatement()
+		public CodePosition()
 		{
 
 		}
 	}
-	public class TryStatement : FlowStatement
+
+	public class Expression: CodePosition
+	{
+		public string Code { get; set; }
+		public Expression(string code, int i)
+		{
+			StartOffset = i - code.Length; // Not sure if this is going to be correct anymore.
+			Code = code;
+		}
+	}
+
+	public class TryStatement : CodePosition
 	{
 		public string Zero { get; set; }
 		public string One { get; set; }
+		public int OneOffset { get; set; }
 		public string Two { get; set; }
 
 		public TryStatement(string zero, string one, string two, int i)
@@ -57,16 +78,38 @@ namespace CodingSeb.ExpressionEvaluator
 			One = string.Empty;
 			Two = string.Empty;
 		}
+
+		public TryStatement(string zero, Expression one, string two, int i)
+		{
+			StartOffset = i - two.Length; // Not sure if this is going to be correct anymore.
+			Zero = zero;
+			One = one.Code;
+			OneOffset = one.StartOffset;
+			Two = two;
+		}
 	}
-	public class IfStatement : FlowStatement
+	public class IfStatement : CodePosition
 	{
 		public string Condition { get; set; }
 		public string Body { get; set; }
-		public IfStatement(string condition, string body, int i, int instructionPointOffset)
+		public int? ConditionStart { get; set; }
+		public Expression ConditionExpression { get; set; }
+		public IfStatement(Expression conditionExpression, string body, int i, int instructionPointOffset)
+		{
+			ConditionExpression = conditionExpression;
+			StartOffset = instructionPointOffset + i - body.Length - 1;
+			Condition = conditionExpression.Code;
+			ConditionStart = conditionExpression.StartOffset;
+			Body = body;
+		}
+
+		public IfStatement(string expressionCode, string body, int i, int instructionPointOffset)
 		{
 			StartOffset = instructionPointOffset + i - body.Length;
-			Condition = condition;
+			Condition = expressionCode;
+			ConditionStart = null;
 			Body = body;
+			ConditionExpression = new Expression(expressionCode, 0);  // This StartOffset will be wrong for the condition.
 		}
 	}
 
@@ -75,6 +118,7 @@ namespace CodingSeb.ExpressionEvaluator
 	/// </summary>
 	public partial class ExpressionEvaluator
 	{
+		Stack<StackFrame> stackFrames = new Stack<StackFrame>();
 		ExecutionPointerChangedEventArgs executionPointerChangedEventArgs = new ExecutionPointerChangedEventArgs();
 
 		ExecutionPointerChangedHandler executionPointerChanged;
@@ -99,15 +143,13 @@ namespace CodingSeb.ExpressionEvaluator
 		}
 
 		public string OriginalScript { get; set; }
-		public int ExecutionPointer { get; set; }
-		public int ExecutionLength { get; set; }
+		public int InstructionPointer { get; set; }
 
 		bool anyoneListening;
 		void ResetExecutionPointer(string script)
 		{
 			OriginalScript = script;
-			ExecutionPointer = 0;
-			ExecutionLength = 0;
+			InstructionPointer = 0;
 		}
 
 		protected virtual void OnExecutionPointerChanged(object sender, ExecutionPointerChangedEventArgs ea)
@@ -115,9 +157,9 @@ namespace CodingSeb.ExpressionEvaluator
 			if (executionPointerChanged != null)
 				executionPointerChanged.Invoke(sender, ea);
 		}
-		void TriggerExecutionPointerChange(int oldExecutionPointer, int oldExecutionLength, int executionPointer, int executionLength, string script)
+		void TriggerExecutionPointerChange(int instructionPointer, string script)
 		{
-			executionPointerChangedEventArgs.Set(OriginalScript, oldExecutionPointer, oldExecutionLength, executionPointer, executionLength, script);
+			executionPointerChangedEventArgs.Set(OriginalScript, instructionPointer, script, stackFrames);
 			OnExecutionPointerChanged(this, executionPointerChangedEventArgs);
 		}
 
@@ -432,20 +474,20 @@ namespace CodingSeb.ExpressionEvaluator
 
 		protected IDictionary<string, Func<ExpressionEvaluator, List<string>, object>> complexStandardFuncsDictionary = new Dictionary<string, Func<ExpressionEvaluator, List<string>, object>>(StringComparer.Ordinal)
 				{
-						{ "Array", (self, args) => args.ConvertAll(self.Evaluate).ToArray() },
+						{ "Array", (self, args) => args.ConvertAll(self.InternalEvaluate).ToArray() },
 						{ "ArrayOfType", (self, args) =>
 								{
-										Array sourceArray = args.Skip(1).Select(self.Evaluate).ToArray();
-										Array typedArray = Array.CreateInstance((Type)self.Evaluate(args[0]), sourceArray.Length);
+										Array sourceArray = args.Skip(1).Select(self.InternalEvaluate).ToArray();
+										Array typedArray = Array.CreateInstance((Type)self.InternalEvaluate(args[0]), sourceArray.Length);
 										Array.Copy(sourceArray, typedArray, sourceArray.Length);
 
 										return typedArray;
 								}
 						},
-						{ "Avg", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.Evaluate(arg))).Sum() / args.Count },
+						{ "Avg", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.InternalEvaluate(arg))).Sum() / args.Count },
 						{ "default", (self, args) =>
 								{
-										object argValue = self.Evaluate(args[0]);
+										object argValue = self.InternalEvaluate(args[0]);
 
 										if (argValue is ClassOrEnumType classOrTypeName)
 												return Activator.CreateInstance(classOrTypeName.Type);
@@ -454,12 +496,12 @@ namespace CodingSeb.ExpressionEvaluator
 								}
 						},
             //{ "if", (self, args) => (bool)self.Evaluate(args[0]) ? self.Evaluate(args[1]) : self.Evaluate(args[2]) },
-            { "in", (self, args) => args.Skip(1).ToList().ConvertAll(self.Evaluate).Contains(self.Evaluate(args[0])) },
-						{ "List", (self, args) => args.ConvertAll(self.Evaluate) },
+            { "in", (self, args) => args.Skip(1).ToList().ConvertAll(self.InternalEvaluate).Contains(self.InternalEvaluate(args[0])) },
+						{ "List", (self, args) => args.ConvertAll(self.InternalEvaluate) },
 						{ "ListOfType", (self, args) =>
 								{
-										Type type = (Type)self.Evaluate(args[0]);
-										Array sourceArray = args.Skip(1).Select(self.Evaluate).ToArray();
+										Type type = (Type)self.InternalEvaluate(args[0]);
+										Array sourceArray = args.Skip(1).Select(self.InternalEvaluate).ToArray();
 										Array typedArray = Array.CreateInstance(type, sourceArray.Length);
 										Array.Copy(sourceArray, typedArray, sourceArray.Length);
 
@@ -472,11 +514,11 @@ namespace CodingSeb.ExpressionEvaluator
 										return list;
 								}
 						},
-						{ "Max", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.Evaluate(arg))).Max() },
-						{ "Min", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.Evaluate(arg))).Min() },
+						{ "Max", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.InternalEvaluate(arg))).Max() },
+						{ "Min", (self, args) => args.ConvertAll(arg => Convert.ToDouble(self.InternalEvaluate(arg))).Min() },
 						{ "new", (self, args) =>
 								{
-										List<object> cArgs = args.ConvertAll(self.Evaluate);
+										List<object> cArgs = args.ConvertAll(self.InternalEvaluate);
 										return cArgs[0] is ClassOrEnumType classOrEnumType ? Activator.CreateInstance(classOrEnumType.Type, cArgs.Skip(1).ToArray()) : null;
 								}
 						},
@@ -484,28 +526,28 @@ namespace CodingSeb.ExpressionEvaluator
 								{
 										if(args.Count == 3)
 										{
-												return Math.Round(Convert.ToDouble(self.Evaluate(args[0])), Convert.ToInt32(self.Evaluate(args[1])), (MidpointRounding)self.Evaluate(args[2]));
+												return Math.Round(Convert.ToDouble(self.InternalEvaluate(args[0])), Convert.ToInt32(self.InternalEvaluate(args[1])), (MidpointRounding)self.InternalEvaluate(args[2]));
 										}
 										else if(args.Count == 2)
 										{
-												object arg2 = self.Evaluate(args[1]);
+												object arg2 = self.InternalEvaluate(args[1]);
 
 												if(arg2 is MidpointRounding midpointRounding)
-														return Math.Round(Convert.ToDouble(self.Evaluate(args[0])), midpointRounding);
+														return Math.Round(Convert.ToDouble(self.InternalEvaluate(args[0])), midpointRounding);
 												else
-														return Math.Round(Convert.ToDouble(self.Evaluate(args[0])), Convert.ToInt32(arg2));
+														return Math.Round(Convert.ToDouble(self.InternalEvaluate(args[0])), Convert.ToInt32(arg2));
 										}
-										else if(args.Count == 1) { return Math.Round(Convert.ToDouble(self.Evaluate(args[0]))); }
+										else if(args.Count == 1) { return Math.Round(Convert.ToDouble(self.InternalEvaluate(args[0]))); }
 										else
 										{
 												throw new ArgumentException();
 										}
 								}
 						},
-						{ "Sign", (self, args) => Math.Sign(Convert.ToDouble(self.Evaluate(args[0]))) },
+						{ "Sign", (self, args) => Math.Sign(Convert.ToDouble(self.InternalEvaluate(args[0]))) },
 						{ "sizeof", (self, args) =>
 								{
-										Type type = ((ClassOrEnumType)self.Evaluate(args[0])).Type;
+										Type type = ((ClassOrEnumType)self.InternalEvaluate(args[0])).Type;
 
 										if(type == typeof(bool))
 												return 1;
@@ -515,7 +557,7 @@ namespace CodingSeb.ExpressionEvaluator
 												return Marshal.SizeOf(type);
 								}
 						},
-						{ "typeof", (self, args) => ((ClassOrEnumType)self.Evaluate(args[0])).Type },
+						{ "typeof", (self, args) => ((ClassOrEnumType)self.InternalEvaluate(args[0])).Type },
 				};
 
 		#endregion
@@ -932,7 +974,7 @@ namespace CodingSeb.ExpressionEvaluator
 		/// <summary>
 		/// Is Fired before a function or method resolution.
 		/// Allow to define a function or method and the corresponding value on the fly.
-		/// Allow also to cancel the evaluation of this function (consider it does'nt exists)
+		/// Allow also to cancel the evaluation of this function (consider it doesn't exists)
 		/// </summary>
 		public event EventHandler<FunctionPreEvaluationEventArg> PreEvaluateFunction;
 
@@ -1034,9 +1076,9 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual object ScriptEvaluate(string script, ref bool valueReturned, ref bool breakCalled, ref bool continueCalled, int instructionPointOffset)
+		protected virtual object ScriptEvaluate(string script, ref bool valueReturned, ref bool breakCalled, ref bool continueCalled, int instructionPointerOffset)
 		{
-			AdvanceExecutionPointer(script, instructionPointOffset, script.Length);
+			AdvanceExecutionPointer(script, instructionPointerOffset);
 
 			object lastResult = null;
 			bool isReturn = valueReturned;
@@ -1052,46 +1094,53 @@ namespace CodingSeb.ExpressionEvaluator
 
 			script = script.TrimEnd();
 
-			object ManageJumpStatementsOrExpressionEval(string expression)
+			object ManageJumpStatementsOrExpressionEval(Expression expression)
 			{
-				expression = expression.Trim();
+				string code = expression.Code;
+				//code = code.Trim();
+				code = TrimCode(code, ref instructionPointerOffset); // Not 100% certain if we want to do this or not.
 
-				if (expression.Equals("break", StringComparisonForCasing))
+				if (code.Equals("break", StringComparisonForCasing))
 				{
+					AdvanceExecutionPointer(expression);
 					isBreak = true;
 					return lastResult;
 				}
 
-				if (expression.Equals("continue", StringComparisonForCasing))
+				if (code.Equals("continue", StringComparisonForCasing))
 				{
+					AdvanceExecutionPointer(expression);
 					isContinue = true;
 					return lastResult;
 				}
 
-				if (expression.StartsWith("throw ", StringComparisonForCasing))
+				if (code.StartsWith("throw ", StringComparisonForCasing))
 				{
-					throw Evaluate(expression.Remove(0, 6)) as Exception;
+					AdvanceExecutionPointer(expression);
+					throw InternalEvaluate(code.Remove(0, 6)) as Exception;
 				}
 
-				expression = returnKeywordRegex.Replace(expression, match =>
+				code = returnKeywordRegex.Replace(code, match =>
 				{
 					if (OptionCaseSensitiveEvaluationActive && !match.Value.StartsWith("return"))
 						return match.Value;
 
 					isReturn = true;
+					AdvanceExecutionPointer(expression);
 					return match.Value.Contains("(") ? "(" : string.Empty;
 				});
 
-				return Evaluate(expression);
+				return EvaluateWithIp(code, expression.StartOffset);
 			}
 
 			object ScriptExpressionEvaluate(ref int index)
 			{
+				int endOfExpressionAbsolute = instructionPointerOffset + index;
 				string expression = script.Substring(startOfExpression, index - startOfExpression);
 
 				startOfExpression = index + 1;
 
-				return ManageJumpStatementsOrExpressionEval(expression);
+				return ManageJumpStatementsOrExpressionEval(new Expression(expression, endOfExpressionAbsolute));
 			}
 
 			bool TryParseStringAndParenthisAndCurlyBrackets(ref int index)
@@ -1108,7 +1157,7 @@ namespace CodingSeb.ExpressionEvaluator
 				else if (script[index] == '(')
 				{
 					index++;
-					GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(script, ref index, false);
+					GetExpressionsBetweenPairs(script, ref index, 0, false);
 				}
 				else if (script[index] == '{')
 				{
@@ -1132,7 +1181,7 @@ namespace CodingSeb.ExpressionEvaluator
 			{
 				if (ifElseStatementsList.Count > 0)
 				{
-					IfStatement ifStatement = ifElseStatementsList.Find(statement => (bool)ManageJumpStatementsOrExpressionEval(statement.Condition));
+					IfStatement ifStatement = ifElseStatementsList.Find(statement => (bool)ManageJumpStatementsOrExpressionEval(statement.ConditionExpression));
 
 					string ifScript = ifStatement?.Body;
 
@@ -1155,7 +1204,7 @@ namespace CodingSeb.ExpressionEvaluator
 					try
 					{
 						string tryScript = tryStatementsList[0].Zero;
-						lastResult = ScriptEvaluate(tryScript, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+						lastResult = ScriptEvaluate(tryScript, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 					}
 					catch (Exception exception)
 					{
@@ -1171,7 +1220,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 								if (exceptionVariable.Length >= 2)
 								{
-									if (!((ClassOrEnumType)Evaluate(exceptionVariable[0])).Type.IsAssignableFrom(exception.GetType()))
+									if (!((ClassOrEnumType)InternalEvaluate(exceptionVariable[0])).Type.IsAssignableFrom(exception.GetType()))
 										continue;
 
 									exceptionName = exceptionVariable[1];
@@ -1180,7 +1229,7 @@ namespace CodingSeb.ExpressionEvaluator
 								Variables[exceptionName] = exception;
 							}
 
-							lastResult = ScriptEvaluate(catchStatement.Two, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+							lastResult = ScriptEvaluate(catchStatement.Two, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 							atLeasOneCatch = true;
 							break;
 						}
@@ -1194,7 +1243,7 @@ namespace CodingSeb.ExpressionEvaluator
 					{
 						if (tryStatementsList.Last().Zero.Equals("finally"))
 						{
-							lastResult = ScriptEvaluate(tryStatementsList.Last().One, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+							lastResult = ScriptEvaluate(tryStatementsList.Last().One, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 						}
 					}
 
@@ -1219,7 +1268,7 @@ namespace CodingSeb.ExpressionEvaluator
 				{
 					i += blockKeywordsBeginingMatch.Success ? blockKeywordsBeginingMatch.Length : blockKeywordsWithoutParenthesesBeginningMatch.Length;
 					string keyword = blockKeywordsBeginingMatch.Success ? blockKeywordsBeginingMatch.Groups["keyword"].Value.Replace(" ", "").Replace("\t", "") : (blockKeywordsWithoutParenthesesBeginningMatch?.Groups["keyword"].Value ?? string.Empty);
-					List<string> keywordAttributes = blockKeywordsBeginingMatch.Success ? GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(script, ref i, true, ";") : null;
+					List<Expression> expressions = blockKeywordsBeginingMatch.Success ? GetExpressionsBetweenPairs(script, ref i, instructionPointerOffset, true, ";") : null;
 
 					if (blockKeywordsBeginingMatch.Success)
 						i++;
@@ -1269,7 +1318,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i, instructionPointOffset));
+							ifElseStatementsList.Add(new IfStatement(expressions[0], subScript, i, instructionPointerOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.ElseIf;
 						}
 					}
@@ -1281,7 +1330,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							ifElseStatementsList.Add(new IfStatement("true", subScript, i, instructionPointOffset));
+							ifElseStatementsList.Add(new IfStatement("true", subScript, i, instructionPointerOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.NoBlockEvaluated;
 						}
 					}
@@ -1293,7 +1342,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							tryStatementsList.Add(new TryStatement("catch", keywordAttributes.Count > 0 ? keywordAttributes[0] : null, subScript, i));
+							tryStatementsList.Add(new TryStatement("catch", expressions.Count > 0 ? expressions[0] : null, subScript, i));
 							tryBlockEvaluatedState = TryBlockEvaluatedState.Catch;
 						}
 					}
@@ -1313,9 +1362,9 @@ namespace CodingSeb.ExpressionEvaluator
 					{
 						ExecuteBlocksStacks();
 
-						if (keyword.Equals("if", StringComparisonForCasing))
+						if (keyword.Equals("if",  StringComparisonForCasing))
 						{
-							ifElseStatementsList.Add(new IfStatement(keywordAttributes[0], subScript, i, instructionPointOffset));
+							ifElseStatementsList.Add(new IfStatement(expressions[0], subScript, i, instructionPointerOffset));
 							ifBlockEvaluatedState = IfBlockEvaluatedState.If;
 							tryBlockEvaluatedState = TryBlockEvaluatedState.NoBlockEvaluated;
 						}
@@ -1331,7 +1380,7 @@ namespace CodingSeb.ExpressionEvaluator
 									&& blockKeywordsBeginingMatch.Groups["keyword"].Value.Equals("while", StringComparisonForCasing))
 							{
 								i += blockKeywordsBeginingMatch.Length;
-								keywordAttributes = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(script, ref i, true, ";");
+								expressions = GetExpressionsBetweenPairs(script, ref i, instructionPointerOffset, true, ";");
 
 								i++;
 
@@ -1343,7 +1392,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 									do
 									{
-										lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+										lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 
 										if (isBreak)
 										{
@@ -1355,7 +1404,7 @@ namespace CodingSeb.ExpressionEvaluator
 											isContinue = false;
 										}
 									}
-									while (!isReturn && (bool)ManageJumpStatementsOrExpressionEval(keywordAttributes[0]));
+									while (!isReturn && (bool)ManageJumpStatementsOrExpressionEval(expressions[0]));
 								}
 								else
 								{
@@ -1364,14 +1413,14 @@ namespace CodingSeb.ExpressionEvaluator
 							}
 							else
 							{
-								throw new ExpressionEvaluatorSyntaxErrorException("No [while] keyword afte the [do] keyword and block");
+								throw new ExpressionEvaluatorSyntaxErrorException("No [while] keyword after the [do] keyword and block");
 							}
 						}
 						else if (keyword.Equals("while", StringComparisonForCasing))
 						{
-							while (!isReturn && (bool)ManageJumpStatementsOrExpressionEval(keywordAttributes[0]))
+							while (!isReturn && (bool)ManageJumpStatementsOrExpressionEval(expressions[0]))
 							{
-								lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+								lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 
 								if (isBreak)
 								{
@@ -1388,13 +1437,13 @@ namespace CodingSeb.ExpressionEvaluator
 						{
 							void forAction(int index)
 							{
-								if (keywordAttributes.Count > index && !keywordAttributes[index].Trim().Equals(string.Empty))
-									ManageJumpStatementsOrExpressionEval(keywordAttributes[index]);
+								if (expressions.Count > index && !expressions[index].Code.Trim().Equals(string.Empty))
+									ManageJumpStatementsOrExpressionEval(expressions[index]);
 							}
 
-							for (forAction(0); !isReturn && (bool)ManageJumpStatementsOrExpressionEval(keywordAttributes[1]); forAction(2))
+							for (forAction(0); !isReturn && (bool)ManageJumpStatementsOrExpressionEval(expressions[1]); forAction(2))
 							{
-								lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+								lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 
 								if (isBreak)
 								{
@@ -1409,7 +1458,7 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else if (keyword.Equals("foreach", StringComparisonForCasing))
 						{
-							Match foreachParenthisEvaluationMatch = foreachParenthisEvaluationRegex.Match(keywordAttributes[0]);
+							Match foreachParenthisEvaluationMatch = foreachParenthisEvaluationRegex.Match(expressions[0].Code);
 
 							if (!foreachParenthisEvaluationMatch.Success)
 							{
@@ -1421,11 +1470,11 @@ namespace CodingSeb.ExpressionEvaluator
 							}
 							else
 							{
-								foreach (dynamic foreachValue in (dynamic)Evaluate(foreachParenthisEvaluationMatch.Groups["collection"].Value))
+								foreach (dynamic foreachValue in (dynamic)InternalEvaluate(foreachParenthisEvaluationMatch.Groups["collection"].Value))
 								{
 									Variables[foreachParenthisEvaluationMatch.Groups["variableName"].Value] = foreachValue;
 
-									lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointOffset + i);
+									lastResult = ScriptEvaluate(subScript, ref isReturn, ref isBreak, ref isContinue, instructionPointerOffset + i);
 
 									if (isBreak)
 									{
@@ -1504,7 +1553,7 @@ namespace CodingSeb.ExpressionEvaluator
 		/// <returns>The result of the operation if syntax is correct casted in the specified type</returns>
 		public T Evaluate<T>(string expression)
 		{
-			return (T)Evaluate(expression);
+			return (T)EvaluateWithIp(expression, 0);
 		}
 
 		private IList<ParsingMethodDelegate> parsingMethods;
@@ -1523,17 +1572,66 @@ namespace CodingSeb.ExpressionEvaluator
 						EvaluateTernaryConditionalOperator,
 				});
 
-		void AdvanceExecutionPointer(string script, int offset, int length)
+		void AdvanceExecutionPointer(string script, int offset)
 		{
 			if (!anyoneListening)
 				return;
 
-			int oldExecutionPointer = ExecutionPointer;
-			int oldExecutionLength = ExecutionLength;
-			ExecutionPointer = offset;
-			ExecutionLength = length;
+			InstructionPointer = offset;
+			
+			TriggerExecutionPointerChange(InstructionPointer, script);
+		}
 
-			TriggerExecutionPointerChange(oldExecutionPointer, oldExecutionLength, ExecutionPointer, ExecutionLength, script);
+		void AdvanceExecutionPointer(Expression expression)
+		{
+			if (!anyoneListening)
+				return;
+
+			InstructionPointer = expression.StartOffset;
+
+			TriggerExecutionPointerChange(InstructionPointer, expression.Code);
+		}
+
+		void PushStack(string expression)
+		{
+			StackFrame stackFrame = new StackFrame();
+			stackFrame.Code = OriginalScript;
+			stackFrame.InstructionPointer = InstructionPointer;
+			stackFrames.Push(stackFrame);
+			OriginalScript = expression;
+			InstructionPointer = 0;
+		}
+
+		void PopStack()
+		{
+			StackFrame stackFrame = stackFrames.Pop();
+			OriginalScript = stackFrame.Code;
+			InstructionPointer = stackFrame.InstructionPointer;
+		}
+
+		public object Evaluate(string expression)
+		{
+			PushStack(expression);
+			try
+			{
+				return EvaluateWithIp(expression, 0);
+			}
+			finally
+			{
+				PopStack();
+			}
+		}
+
+		public object InternalEvaluate(string expression)
+		{
+			return EvaluateWithIp(expression, 0);
+		}
+
+		string TrimCode(string expression, ref int instructionPointerOffset)
+		{
+			string newExpression = expression.TrimStart(new char[] { '\r', '\n', '\t', ' ' } );
+			instructionPointerOffset += expression.Length - newExpression.Length;
+			return expression.Trim();
 		}
 
 		/// <summary>
@@ -1541,9 +1639,10 @@ namespace CodingSeb.ExpressionEvaluator
 		/// </summary>
 		/// <param name="expression">the math or pseudo C# expression to evaluate</param>
 		/// <returns>The result of the operation if syntax is correct</returns>
-		public object Evaluate(string expression)
+		public object EvaluateWithIp(string expression, int instructionPointerOffset = 0)
 		{
-			expression = expression.Trim();
+			expression = TrimCode(expression, ref instructionPointerOffset);
+			AdvanceExecutionPointer(expression, instructionPointerOffset);
 
 			Stack<object> stack = new Stack<object>();
 
@@ -1552,7 +1651,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 			for (int i = 0; i < expression.Length; i++)
 			{
-				if (!ParsingMethods.Any(parsingMethod => parsingMethod(expression, stack, ref i)))
+				if (!ParsingMethods.Any(parsingMethod => parsingMethod(expression, stack, ref i, instructionPointerOffset)))
 				{
 					string s = expression.Substring(i, 1);
 
@@ -1572,7 +1671,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 		#region Sub parts evaluate methods (protected virtual)
 
-		protected virtual bool EvaluateCast(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateCast(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			Match castMatch = Regex.Match(expression.Substring(i), CastRegexPattern, optionCaseSensitiveEvaluationActive ? RegexOptions.None : RegexOptions.IgnoreCase);
 
@@ -1594,7 +1693,7 @@ namespace CodingSeb.ExpressionEvaluator
 			return false;
 		}
 
-		protected virtual bool EvaluateNumber(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateNumber(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			string restOfExpression = expression.Substring(i);
 			Match numberMatch = Regex.Match(restOfExpression, numberRegexPattern, RegexOptions.IgnoreCase);
@@ -1660,7 +1759,7 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual bool EvaluateInstanceCreationWithNewKeyword(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateInstanceCreationWithNewKeyword(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			if (!OptionNewKeywordEvaluationActive)
 				return false;
@@ -1671,7 +1770,7 @@ namespace CodingSeb.ExpressionEvaluator
 					&& (stack.Count == 0
 					|| stack.Peek() is ExpressionOperator))
 			{
-				void InitSimpleObjet(object element, List<string> initArgs)
+				void InitSimpleObject(object element, List<Expression> initArgs)
 				{
 					string variable = "V" + Guid.NewGuid().ToString().Replace("-", "");
 
@@ -1679,11 +1778,11 @@ namespace CodingSeb.ExpressionEvaluator
 
 					initArgs.ForEach(subExpr =>
 					{
-						if (subExpr.Contains("="))
+						if (subExpr.Code.Contains("="))
 						{
-							string trimmedSubExpr = subExpr.TrimStart();
+							string trimmedSubExpr = subExpr.Code.TrimStart();
 
-							Evaluate($"{variable}{(trimmedSubExpr.StartsWith("[") ? string.Empty : ".")}{trimmedSubExpr}");
+							EvaluateWithIp($"{variable}{(trimmedSubExpr.StartsWith("[") ? string.Empty : ".")}{trimmedSubExpr}", instructionPointerOffset);
 						}
 						else
 						{
@@ -1700,9 +1799,9 @@ namespace CodingSeb.ExpressionEvaluator
 				{
 					object element = new ExpandoObject();
 
-					List<string> initArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionInitializersSeparator, "{", "}");
+					List<Expression> initArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionInitializersSeparator, "{", "}");
 
-					InitSimpleObjet(element, initArgs);
+					InitSimpleObject(element, initArgs);
 
 					stack.Push(element);
 				}
@@ -1715,7 +1814,7 @@ namespace CodingSeb.ExpressionEvaluator
 					if (type == null)
 						throw new ExpressionEvaluatorSyntaxErrorException($"Type or class {completeName}{genericTypes} is unknown");
 
-					void Init(object element, List<string> initArgs)
+					void Init(object element, List<Expression> initArgs)
 					{
 						if (typeof(IEnumerable).IsAssignableFrom(type)
 								&& !typeof(IDictionary).IsAssignableFrom(type)
@@ -1723,23 +1822,23 @@ namespace CodingSeb.ExpressionEvaluator
 						{
 							MethodInfo methodInfo = type.GetMethod("Add", BindingFlags.Public | BindingFlags.Instance);
 
-							initArgs.ForEach(subExpr => methodInfo.Invoke(element, new object[] { Evaluate(subExpr) }));
+							initArgs.ForEach(subExpr => methodInfo.Invoke(element, new object[] { EvaluateWithIp(subExpr.Code, subExpr.StartOffset) }));
 						}
 						else if (typeof(IDictionary).IsAssignableFrom(type)
-								&& initArgs.All(subExpr => subExpr.TrimStart().StartsWith("{"))
+								&& initArgs.All(subExpr => subExpr.Code.TrimStart().StartsWith("{"))
 								&& !typeof(ExpandoObject).IsAssignableFrom(type))
 						{
 							initArgs.ForEach(subExpr =>
 							{
-								int subIndex = subExpr.IndexOf("{") + 1;
+								int subIndex = subExpr.Code.IndexOf("{") + 1;
 
-								List<string> subArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(subExpr, ref subIndex, true, OptionInitializersSeparator, "{", "}");
+								List<Expression> subArgs = GetExpressionsBetweenPairs(subExpr.Code, ref subIndex, instructionPointerOffset, true, OptionInitializersSeparator, "{", "}");
 
 								if (subArgs.Count == 2)
 								{
 									dynamic indexedObject = element;
-									dynamic index = Evaluate(subArgs[0]);
-									dynamic value = Evaluate(subArgs[1]);
+									dynamic index = EvaluateWithIp(subArgs[0].Code, subArgs[0].StartOffset);
+									dynamic value = EvaluateWithIp(subArgs[1].Code, subArgs[1].StartOffset);
 
 									indexedObject[index] = value;
 								}
@@ -1751,16 +1850,17 @@ namespace CodingSeb.ExpressionEvaluator
 						}
 						else
 						{
-							InitSimpleObjet(element, initArgs);
+							InitSimpleObject(element, initArgs);
 						}
 					}
 
 					if (instanceCreationMatch.Groups["isfunction"].Success)
 					{
-						List<string> constructorArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionFunctionArgumentsSeparator);
+						List<Expression> constructorArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionFunctionArgumentsSeparator);
 						i++;
 
-						List<object> cArgs = constructorArgs.ConvertAll(Evaluate);
+
+						List<object> cArgs = ToStrList(constructorArgs).ConvertAll(InternalEvaluate);
 
 						object element = Activator.CreateInstance(type, cArgs.ToArray());
 
@@ -1770,7 +1870,7 @@ namespace CodingSeb.ExpressionEvaluator
 						{
 							i += blockBeginningMatch.Length;
 
-							List<string> initArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionInitializersSeparator, "{", "}");
+							List<Expression> initArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionInitializersSeparator, "{", "}");
 
 							Init(element, initArgs);
 						}
@@ -1785,7 +1885,7 @@ namespace CodingSeb.ExpressionEvaluator
 					{
 						object element = Activator.CreateInstance(type, new object[0]);
 
-						List<string> initArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionInitializersSeparator, "{", "}");
+						List<Expression> initArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionInitializersSeparator, "{", "}");
 
 						Init(element, initArgs);
 
@@ -1793,13 +1893,13 @@ namespace CodingSeb.ExpressionEvaluator
 					}
 					else if (instanceCreationMatch.Groups["isArray"].Success)
 					{
-						List<string> arrayArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionInitializersSeparator, "[", "]");
+						List<Expression> arrayArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionInitializersSeparator, "[", "]");
 						i++;
 						Array array = null;
 
 						if (arrayArgs.Count > 0)
 						{
-							array = Array.CreateInstance(type, arrayArgs.ConvertAll(subExpression => Convert.ToInt32(Evaluate(subExpression))).ToArray());
+							array = Array.CreateInstance(type, arrayArgs.ConvertAll(subExpression => Convert.ToInt32(EvaluateWithIp(subExpression.Code, subExpression.StartOffset))).ToArray());
 						}
 
 						Match initInNewBeginningMatch = initInNewBeginningRegex.Match(expression.Substring(i));
@@ -1808,12 +1908,12 @@ namespace CodingSeb.ExpressionEvaluator
 						{
 							i += initInNewBeginningMatch.Length;
 
-							List<string> arrayElements = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionInitializersSeparator, "{", "}");
+							List<Expression> arrayElements = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionInitializersSeparator, "{", "}");
 
 							if (array == null)
 								array = Array.CreateInstance(type, arrayElements.Count);
 
-							Array.Copy(arrayElements.ConvertAll(Evaluate).ToArray(), array, arrayElements.Count);
+							Array.Copy(ToStrList(arrayElements).ConvertAll(InternalEvaluate).ToArray(), array, arrayElements.Count);
 						}
 
 						stack.Push(array);
@@ -1832,7 +1932,11 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual bool EvaluateVarOrFunc(string expression, Stack<object> stack, ref int i)
+		List<string> ToStrList(List<Expression> funcArgs)
+		{
+			return funcArgs.Select(expression => expression.Code).ToList();
+		}
+		protected virtual bool EvaluateVarOrFunc(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			Match varFuncMatch = varOrFunctionRegEx.Match(expression.Substring(i));
 
@@ -1856,7 +1960,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 				if (varFuncMatch.Groups["isfunction"].Success)
 				{
-					List<string> funcArgs = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true, OptionFunctionArgumentsSeparator);
+					List<Expression> funcArgs = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true, OptionFunctionArgumentsSeparator);
 					if (varFuncMatch.Groups["inObject"].Success)
 					{
 						if (stack.Count == 0 || stack.Peek() is ExpressionOperator)
@@ -1886,7 +1990,7 @@ namespace CodingSeb.ExpressionEvaluator
 								}
 								else
 								{
-									FunctionPreEvaluationEventArg functionPreEvaluationEventArg = new FunctionPreEvaluationEventArg(varFuncName, Evaluate, funcArgs, this, obj, genericsTypes, GetConcreteTypes);
+									FunctionPreEvaluationEventArg functionPreEvaluationEventArg = new FunctionPreEvaluationEventArg(varFuncName, InternalEvaluate, ToStrList(funcArgs), this, obj, genericsTypes, GetConcreteTypes);
 
 									PreEvaluateFunction?.Invoke(this, functionPreEvaluationEventArg);
 
@@ -1900,7 +2004,7 @@ namespace CodingSeb.ExpressionEvaluator
 									}
 									else
 									{
-										List<object> oArgs = funcArgs.ConvertAll(Evaluate);
+										List<object> oArgs = ToStrList(funcArgs).ConvertAll(InternalEvaluate);
 										BindingFlags flag = DetermineInstanceOrStatic(ref objType, ref obj, ref valueTypeNestingTrace);
 
 										if (!OptionStaticMethodsCallActive && (flag & BindingFlags.Static) != 0)
@@ -1958,7 +2062,7 @@ namespace CodingSeb.ExpressionEvaluator
 											}
 											else
 											{
-												FunctionEvaluationEventArg functionEvaluationEventArg = new FunctionEvaluationEventArg(varFuncName, Evaluate, funcArgs, this, obj ?? keepObj, genericsTypes, GetConcreteTypes);
+												FunctionEvaluationEventArg functionEvaluationEventArg = new FunctionEvaluationEventArg(varFuncName, InternalEvaluate, ToStrList(funcArgs), this, obj ?? keepObj, genericsTypes, GetConcreteTypes);
 
 												EvaluateFunction?.Invoke(this, functionEvaluationEventArg);
 
@@ -1991,7 +2095,7 @@ namespace CodingSeb.ExpressionEvaluator
 					}
 					else
 					{
-						FunctionPreEvaluationEventArg functionPreEvaluationEventArg = new FunctionPreEvaluationEventArg(varFuncName, Evaluate, funcArgs, this, null, genericsTypes, GetConcreteTypes);
+						FunctionPreEvaluationEventArg functionPreEvaluationEventArg = new FunctionPreEvaluationEventArg(varFuncName, InternalEvaluate, ToStrList(funcArgs), this, null, genericsTypes, GetConcreteTypes);
 
 						PreEvaluateFunction?.Invoke(this, functionPreEvaluationEventArg);
 
@@ -2003,21 +2107,22 @@ namespace CodingSeb.ExpressionEvaluator
 						{
 							stack.Push(functionPreEvaluationEventArg.Value);
 						}
-						else if (DefaultFunctions(varFuncName, funcArgs, out object funcResult))
+						else if (DefaultFunctions(varFuncName, ToStrList(funcArgs), out object funcResult))
 						{
 							stack.Push(funcResult);
 						}
 						else if (Variables.TryGetValue(varFuncName, out object o) && o is InternalDelegate lambdaExpression)
 						{
-							stack.Push(lambdaExpression.Invoke(funcArgs.ConvertAll(e => Evaluate(e)).ToArray()));
+							stack.Push(lambdaExpression.Invoke(funcArgs.ConvertAll(e => InternalEvaluate(e.Code)).ToArray()));
 						}
 						else if (Variables.TryGetValue(varFuncName, out o) && o is Delegate delegateVar)
 						{
-							stack.Push(delegateVar.DynamicInvoke(funcArgs.ConvertAll(e => Evaluate(e)).ToArray()));
+							stack.Push(delegateVar.DynamicInvoke(funcArgs.ConvertAll(e => InternalEvaluate(e.Code)).ToArray()));
 						}
 						else
 						{
-							FunctionEvaluationEventArg functionEvaluationEventArg = new FunctionEvaluationEventArg(varFuncName, Evaluate, funcArgs, this, genericTypes: genericsTypes, evaluateGenericTypes: GetConcreteTypes);
+							FunctionEvaluationEventArg functionEvaluationEventArg = new FunctionEvaluationEventArg(varFuncName, InternalEvaluate, ToStrList(funcArgs), this, genericTypes: genericsTypes, evaluateGenericTypes: GetConcreteTypes);
+
 
 							EvaluateFunction?.Invoke(this, functionEvaluationEventArg);
 
@@ -2151,11 +2256,11 @@ namespace CodingSeb.ExpressionEvaluator
 											{
 												ExpressionOperator op = operatorsDictionary[varFuncMatch.Groups["assignmentPrefix"].Value];
 
-												varValue = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(op))[op](varValue, Evaluate(rightExpression));
+												varValue = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(op))[op](varValue, InternalEvaluate(rightExpression));
 											}
 											else
 											{
-												varValue = Evaluate(rightExpression);
+												varValue = InternalEvaluate(rightExpression);
 											}
 
 											stack.Clear();
@@ -2279,11 +2384,11 @@ namespace CodingSeb.ExpressionEvaluator
 
 										ExpressionOperator op = operatorsDictionary[varFuncMatch.Groups["assignmentPrefix"].Value];
 
-										cusVarValueToPush = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(op))[op](cusVarValueToPush, Evaluate(rightExpression));
+										cusVarValueToPush = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(op))[op](cusVarValueToPush, InternalEvaluate(rightExpression));
 									}
 									else
 									{
-										cusVarValueToPush = Evaluate(rightExpression);
+										cusVarValueToPush = EvaluateWithIp(rightExpression, instructionPointerOffset + i - rightExpression.Length);
 									}
 
 									stack.Clear();
@@ -2415,7 +2520,7 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual bool EvaluateChar(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateChar(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			if (!OptionCharEvaluationActive)
 				return false;
@@ -2466,7 +2571,7 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual bool EvaluateOperators(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateOperators(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			string regexPattern = "^(" + string.Join("|", operatorsDictionary
 					.Keys
@@ -2486,7 +2591,7 @@ namespace CodingSeb.ExpressionEvaluator
 			return false;
 		}
 
-		protected virtual bool EvaluateTernaryConditionalOperator(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateTernaryConditionalOperator(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			if (expression.Substring(i, 1).Equals("?"))
 			{
@@ -2508,13 +2613,13 @@ namespace CodingSeb.ExpressionEvaluator
 					else if (s2.Equals("("))
 					{
 						j++;
-						GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(restOfExpression, ref j, false);
+						GetExpressionsBetweenPairs(restOfExpression, ref j, instructionPointerOffset, false);
 					}
 					else if (s2.Equals(":"))
 					{
 						stack.Clear();
 
-						stack.Push(condition ? Evaluate(restOfExpression.Substring(1, j - 1)) : Evaluate(restOfExpression.Substring(j + 1)));
+						stack.Push(condition ? InternalEvaluate(restOfExpression.Substring(1, j - 1)) : InternalEvaluate(restOfExpression.Substring(j + 1)));
 
 						i = expression.Length;
 
@@ -2526,7 +2631,7 @@ namespace CodingSeb.ExpressionEvaluator
 			return false;
 		}
 
-		protected virtual bool EvaluateParenthis(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateParenthis(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			string s = expression.Substring(i, 1);
 
@@ -2539,19 +2644,19 @@ namespace CodingSeb.ExpressionEvaluator
 
 				if (stack.Count > 0 && stack.Peek() is InternalDelegate)
 				{
-					List<string> expressionsInParenthis = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, true);
+					List<Expression> expressionsInParenthis = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, true);
 
 					InternalDelegate lambdaDelegate = stack.Pop() as InternalDelegate;
 
-					stack.Push(lambdaDelegate(expressionsInParenthis.ConvertAll(Evaluate).ToArray()));
+					stack.Push(lambdaDelegate(ToStrList(expressionsInParenthis).ConvertAll(InternalEvaluate).ToArray()));
 				}
 				else
 				{
 					CorrectStackWithUnaryPlusOrMinusBeforeParenthisIfNecessary(stack);
 
-					List<string> expressionsInParenthis = GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, false);
+					List<Expression> expressionsInParenthis = GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, false);
 
-					stack.Push(Evaluate(expressionsInParenthis[0]));
+					stack.Push(InternalEvaluate(expressionsInParenthis[0].Code));
 				}
 
 				return true;
@@ -2577,7 +2682,7 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 		}
 
-		protected virtual bool EvaluateIndexing(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateIndexing(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			if (!OptionIndexingActive)
 				return false;
@@ -2620,7 +2725,7 @@ namespace CodingSeb.ExpressionEvaluator
 					throw new Exception($"{bracketCount} ']' character {beVerb} missing in expression : [{expression}]");
 				}
 
-				dynamic right = Evaluate(innerExp.ToString());
+				dynamic right = InternalEvaluate(innerExp.ToString());
 				ExpressionOperator op = indexingBeginningMatch.Length == 2 ? ExpressionOperator.IndexingWithNullConditional : ExpressionOperator.Indexing;
 				dynamic left = stack.Pop();
 
@@ -2665,11 +2770,11 @@ namespace CodingSeb.ExpressionEvaluator
 
 							valueToPush = OperatorsEvaluations[0][op](left, right);
 
-							valueToPush = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(prefixOp))[prefixOp](valueToPush, Evaluate(rightExpression));
+							valueToPush = OperatorsEvaluations.ToList().Find(dict => dict.ContainsKey(prefixOp))[prefixOp](valueToPush, InternalEvaluate(rightExpression));
 						}
 						else
 						{
-							valueToPush = Evaluate(rightExpression);
+							valueToPush = InternalEvaluate(rightExpression);
 						}
 
 						if (left is IDictionary<string, object> dictionaryLeft)
@@ -2693,7 +2798,7 @@ namespace CodingSeb.ExpressionEvaluator
 			return false;
 		}
 
-		protected virtual bool EvaluateString(string expression, Stack<object> stack, ref int i)
+		protected virtual bool EvaluateString(string expression, Stack<object> stack, ref int i, int instructionPointerOffset)
 		{
 			if (!OptionStringEvaluationActive)
 				return false;
@@ -2777,7 +2882,7 @@ namespace CodingSeb.ExpressionEvaluator
 								string beVerb = bracketCount == 1 ? "is" : "are";
 								throw new Exception($"{bracketCount} '}}' character {beVerb} missing in expression : [{expression}]");
 							}
-							resultString.Append(Evaluate(innerExp.ToString()));
+							resultString.Append(InternalEvaluate(innerExp.ToString()));
 						}
 					}
 					else if (expression.Substring(i, expression.Length - i)[0] == '}')
@@ -2915,7 +3020,7 @@ namespace CodingSeb.ExpressionEvaluator
 
 		#region Utils methods for parsing and interpretation
 
-		protected delegate bool ParsingMethodDelegate(string expression, Stack<object> stack, ref int i);
+		protected delegate bool ParsingMethodDelegate(string expression, Stack<object> stack, ref int i, int instructionPointerOffset);
 
 		protected delegate dynamic InternalDelegate(params dynamic[] args);
 
@@ -2953,7 +3058,7 @@ namespace CodingSeb.ExpressionEvaluator
 					}
 					else
 					{
-						result = Evaluate(lambdaExpressionMatch.Groups["expression"].Value);
+						result = InternalEvaluate(lambdaExpressionMatch.Groups["expression"].Value);
 					}
 
 					variables = savedVars;
@@ -3181,9 +3286,19 @@ namespace CodingSeb.ExpressionEvaluator
 			return currentScript;
 		}
 
-		protected List<string> GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(string expression, ref int i, bool checkSeparator, string separator = ",", string startChar = "(", string endChar = ")")
+		string GetCode(List<Expression> expressionsBetweenPairs)
 		{
-			List<string> expressionsList = new List<string>();
+			if (expressionsBetweenPairs == null || expressionsBetweenPairs.Count == 0)
+				return string.Empty;
+			string code = expressionsBetweenPairs[0].Code;
+			if (code == null)
+				return string.Empty;
+			return code;
+		}
+
+		protected List<Expression> GetExpressionsBetweenPairs(string expression, ref int i, int instructionPointerOffset, bool checkSeparator, string separator = ",", string startChar = "(", string endChar = ")")
+		{
+			List<Expression> expressionsList = new List<Expression>();
 
 			string s;
 			string currentExpression = string.Empty;
@@ -3216,19 +3331,19 @@ namespace CodingSeb.ExpressionEvaluator
 					else if (s.Equals("("))
 					{
 						i++;
-						currentExpression += "(" + GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, false, ",", "(", ")").SingleOrDefault() + ")";
+						currentExpression += "(" + GetCode(GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, false, ",", "(", ")")) + ")";
 						continue;
 					}
 					else if (s.Equals("{"))
 					{
 						i++;
-						currentExpression += "{" + GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, false, ",", "{", "}").SingleOrDefault() + "}";
+						currentExpression += "{" + GetCode(GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, false, ",", "{", "}")) + "}";
 						continue;
 					}
 					else if (s.Equals("["))
 					{
 						i++;
-						currentExpression += "[" + GetExpressionsBetweenParenthesesOrOtherImbricableBrackets(expression, ref i, false, ",", "[", "]").SingleOrDefault() + "]";
+						currentExpression += "[" + GetCode(GetExpressionsBetweenPairs(expression, ref i, instructionPointerOffset, false, ",", "[", "]")) + "]";
 						continue;
 					}
 
@@ -3238,14 +3353,14 @@ namespace CodingSeb.ExpressionEvaluator
 						if (bracketCount == 0)
 						{
 							if (!currentExpression.Trim().Equals(string.Empty))
-								expressionsList.Add(currentExpression);
+								expressionsList.Add(new Expression(currentExpression, instructionPointerOffset + i));
 							break;
 						}
 					}
 
 					if (checkSeparator && s.Equals(separator) && bracketCount == 1)
 					{
-						expressionsList.Add(currentExpression);
+						expressionsList.Add(new Expression(currentExpression, instructionPointerOffset + i));
 						currentExpression = string.Empty;
 					}
 					else
@@ -3270,11 +3385,11 @@ namespace CodingSeb.ExpressionEvaluator
 
 			if (simpleDoubleMathFuncsDictionary.TryGetValue(name, out Func<double, double> func))
 			{
-				result = func(Convert.ToDouble(Evaluate(args[0])));
+				result = func(Convert.ToDouble(InternalEvaluate(args[0])));
 			}
 			else if (doubleDoubleMathFuncsDictionary.TryGetValue(name, out Func<double, double, double> func2))
 			{
-				result = func2(Convert.ToDouble(Evaluate(args[0])), Convert.ToDouble(Evaluate(args[1])));
+				result = func2(Convert.ToDouble(InternalEvaluate(args[0])), Convert.ToDouble(InternalEvaluate(args[1])));
 			}
 			else if (complexStandardFuncsDictionary.TryGetValue(name, out Func<ExpressionEvaluator, List<string>, object> complexFunc))
 			{
@@ -3282,11 +3397,11 @@ namespace CodingSeb.ExpressionEvaluator
 			}
 			else if (OptionEvaluateFunctionActive && name.Equals("Evaluate", StringComparisonForCasing))
 			{
-				result = Evaluate((string)Evaluate(args[0]));
+				result = InternalEvaluate((string)InternalEvaluate(args[0]));
 			}
 			else if (OptionScriptEvaluateFunctionActive && name.Equals("ScriptEvaluate", StringComparisonForCasing))
 			{
-				result = ScriptEvaluate((string)Evaluate(args[0]));
+				result = ScriptEvaluate((string)InternalEvaluate(args[0]));
 			}
 			else
 			{

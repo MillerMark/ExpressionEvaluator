@@ -8,6 +8,7 @@
 *******************************************************************************************************/
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace CodingSeb.ExpressionEvaluator
@@ -19,21 +20,17 @@ namespace CodingSeb.ExpressionEvaluator
 		{
 		}
 
-		public void Set(string originalScript, int oldExecutionPointer, int oldExecutionLength, int executionPointer, int executionLength, string script)
+		public void Set(string originalScript, int instructionPointer, string script, Stack<StackFrame> stackFrames)
 		{
-			Script = script;
+			StackFrames = stackFrames;
+			Code = script;
 			OriginalScript = originalScript;
-			ExecutionPointer = executionPointer;
-			OldExecutionLength = oldExecutionLength;
-			OldExecutionPointer = oldExecutionPointer;
-			ExecutionLength = executionLength;
+			InstructionPointer = instructionPointer;
 		}
 
-		public int ExecutionLength { get; set; }
-		public int OldExecutionPointer { get; set; }
-		public int OldExecutionLength { get; set; }
-		public int ExecutionPointer { get; set; }
+		public int InstructionPointer { get; set; }
 		public string OriginalScript { get; set; }
-		public string Script { get; set; }
+		public string Code { get; set; }
+		public Stack<StackFrame> StackFrames { get; set; }
 	}
 }
